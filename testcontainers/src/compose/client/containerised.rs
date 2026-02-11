@@ -1,13 +1,13 @@
 use crate::{
     compose::{
         client::{ComposeInterface, DownCommand, UpCommand},
-        error::Result,
+        error::{ComposeError, Result},
         ContainerisedComposeOptions,
     },
     core::{CmdWaitFor, ExecCommand},
     images::docker_cli::DockerCli,
     runners::AsyncRunner,
-    ContainerAsync, ContainerRequest, ImageExt,
+    ContainerAsync, ContainerRequest, ImageExt, TestcontainersError,
 };
 
 pub(crate) struct ContainerisedComposeCli {
@@ -77,10 +77,37 @@ impl ComposeInterface for ContainerisedComposeCli {
         cmd_parts.push("--wait-timeout".to_string());
         cmd_parts.push(command.wait_timeout.as_secs().to_string());
 
-        let exec = ExecCommand::new(cmd_parts)
-            .with_cmd_ready_condition(CmdWaitFor::exit_code(0))
-            .with_env_vars(command.env_vars);
-        self.container.exec(exec).await?;
+        log::debug!("Containerised compose up command: {:?}", cmd_parts);
+
+        let exec = ExecCommand::new(cmd_parts).with_env_vars(command.env_vars);
+        let mut result = self.container.exec(exec).await?;
+
+        // Wait for the process to exit and check the result
+        let exit_code = loop {
+            if let Some(code) = result.exit_code().await? {
+                break code;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
+
+        if exit_code != 0 {
+            let stderr = result.stderr_to_vec().await.unwrap_or_default();
+            let stdout = result.stdout_to_vec().await.unwrap_or_default();
+            let stderr_str = String::from_utf8_lossy(&stderr);
+            let stdout_str = String::from_utf8_lossy(&stdout);
+            log::error!("docker compose up failed with exit code {exit_code}");
+            if !stdout_str.is_empty() {
+                log::error!("stdout: {stdout_str}");
+            }
+            if !stderr_str.is_empty() {
+                log::error!("stderr: {stderr_str}");
+            }
+            return Err(ComposeError::Testcontainers(
+                TestcontainersError::other(format!(
+                    "docker compose up exited with code {exit_code}: {stderr_str}"
+                )),
+            ));
+        }
 
         Ok(())
     }
